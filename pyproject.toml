@@ -1,13 +1,14 @@
 [project]
 name = "selenium-mcp"
-version = "0.1.0"
-description = "A Model Context Protocol server that exposes Selenium WebDriver so an LLM can fully operate a web browser."
+version = "0.2.0"
+description = "A Model Context Protocol server that exposes Selenium WebDriver plus an embedded mitmproxy, so an LLM can fully operate a web browser and inspect every request it makes."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
-    "mcp>=1.5.0",
+    "mcp>=1.10,<2",
     "selenium>=4.49.0",
+    "mitmproxy>=11.0",
 ]
 
 [project.scripts]

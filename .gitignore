@@ -12,3 +12,5 @@ env/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+*.har
+.selenium-mcp/

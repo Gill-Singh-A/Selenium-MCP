@@ -3,6 +3,10 @@
 A single process-wide :class:`Session` holds at most one live browser. Every
 MCP tool goes through this module so that locator resolution, waiting and
 error handling behave consistently.
+
+Unless capture is switched off, starting a browser also starts the embedded
+mitmproxy from :mod:`selenium_mcp.proxy` and launches the browser behind it, so
+every request/response it makes is recorded for the traffic tools to inspect.
 """
 
 from __future__ import annotations
@@ -19,6 +23,8 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+
+from .proxy import ProxyError, proxy
 
 # Map the friendly strings an LLM will produce to Selenium's By constants.
 BY_STRATEGIES = {
@@ -56,6 +62,8 @@ class Session:
     def __init__(self) -> None:
         self._driver: Optional[WebDriver] = None
         self._default_timeout: float = 10.0
+        # True when start() launched the proxy itself, so close() may stop it again.
+        self._owns_proxy: bool = False
 
     # -- lifecycle ---------------------------------------------------------
     @property
@@ -78,6 +86,9 @@ class Session:
         window_height: int = 800,
         user_agent: Optional[str] = None,
         default_timeout: float = 10.0,
+        capture_traffic: bool = True,
+        proxy_port: Optional[int] = None,
+        capture_filter: Optional[str] = None,
     ) -> str:
         if self._driver is not None:
             raise BrowserError(
@@ -87,42 +98,84 @@ class Session:
         browser = (browser or "chrome").strip().lower()
         self._default_timeout = default_timeout
 
-        if browser in ("chrome", "chromium"):
-            opts = ChromeOptions()
-            if headless:
-                opts.add_argument("--headless=new")
-            opts.add_argument(f"--window-size={window_width},{window_height}")
-            opts.add_argument("--no-sandbox")
-            opts.add_argument("--disable-dev-shm-usage")
-            opts.add_argument("--disable-gpu")
-            if browser == "chromium":
-                opts.binary_location = "/usr/bin/chromium"
-            if user_agent:
-                opts.add_argument(f"--user-agent={user_agent}")
-            self._driver = webdriver.Chrome(
-                service=ChromeService(), options=opts
-            )
-        elif browser == "firefox":
-            opts = FirefoxOptions()
-            if headless:
-                opts.add_argument("--headless")
-            opts.add_argument(f"--width={window_width}")
-            opts.add_argument(f"--height={window_height}")
-            if user_agent:
-                opts.set_preference("general.useragent.override", user_agent)
-            self._driver = webdriver.Firefox(
-                service=FirefoxService(), options=opts
+        # Bring the proxy up first: the browser must be launched already pointing
+        # at it, and a capture failure should not leave a stray browser behind.
+        started_proxy = False
+        if capture_traffic and not proxy.is_running:
+            try:
+                proxy.start(port=proxy_port, capture_filter=capture_filter)
+            except ProxyError as exc:
+                raise BrowserError(f"Could not start traffic capture: {exc}") from exc
+            started_proxy = True
+
+        try:
+            if browser in ("chrome", "chromium"):
+                opts = ChromeOptions()
+                if headless:
+                    opts.add_argument("--headless=new")
+                opts.add_argument(f"--window-size={window_width},{window_height}")
+                opts.add_argument("--no-sandbox")
+                opts.add_argument("--disable-dev-shm-usage")
+                opts.add_argument("--disable-gpu")
+                if browser == "chromium":
+                    opts.binary_location = "/usr/bin/chromium"
+                if user_agent:
+                    opts.add_argument(f"--user-agent={user_agent}")
+                if capture_traffic:
+                    opts.add_argument(f"--proxy-server={proxy.proxy_url}")
+                    # Chrome bypasses the proxy for localhost by default; <-loopback>
+                    # turns that off so traffic to local apps is captured too.
+                    opts.add_argument("--proxy-bypass-list=<-loopback>")
+                    # Trust mitmproxy's on-the-fly certificates.
+                    opts.set_capability("acceptInsecureCerts", True)
+                self._driver = webdriver.Chrome(
+                    service=ChromeService(), options=opts
+                )
+            elif browser == "firefox":
+                opts = FirefoxOptions()
+                if headless:
+                    opts.add_argument("--headless")
+                opts.add_argument(f"--width={window_width}")
+                opts.add_argument(f"--height={window_height}")
+                if user_agent:
+                    opts.set_preference("general.useragent.override", user_agent)
+                if capture_traffic:
+                    opts.set_preference("network.proxy.type", 1)  # manual
+                    opts.set_preference("network.proxy.http", proxy.host)
+                    opts.set_preference("network.proxy.http_port", proxy.port)
+                    opts.set_preference("network.proxy.ssl", proxy.host)
+                    opts.set_preference("network.proxy.ssl_port", proxy.port)
+                    # Firefox also skips the proxy for localhost unless told otherwise.
+                    opts.set_preference("network.proxy.allow_hijacking_localhost", True)
+                    opts.set_capability("acceptInsecureCerts", True)
+                self._driver = webdriver.Firefox(
+                    service=FirefoxService(), options=opts
+                )
+            else:
+                raise BrowserError(
+                    f"Unsupported browser {browser!r}. Use 'chrome', "
+                    "'chromium' or 'firefox'."
+                )
+
+            self._driver.set_window_size(window_width, window_height)
+        except Exception:
+            # Don't leave an orphaned proxy behind if the browser won't start.
+            if started_proxy:
+                proxy.stop()
+            raise
+
+        self._owns_proxy = started_proxy
+        if capture_traffic and proxy.is_running:
+            capture = (
+                f" Traffic capture is on via {proxy.proxy_url}"
+                + (f" (filter: {proxy.capture_filter})" if proxy.capture_filter else "")
+                + " — use list_requests to see what the browser requests."
             )
         else:
-            raise BrowserError(
-                f"Unsupported browser {browser!r}. Use 'chrome', "
-                "'chromium' or 'firefox'."
-            )
-
-        self._driver.set_window_size(window_width, window_height)
+            capture = " Traffic capture is off."
         return (
             f"Started {browser} (headless={headless}) at "
-            f"{window_width}x{window_height}."
+            f"{window_width}x{window_height}.{capture}"
         )
 
     def close(self) -> str:
@@ -132,6 +185,11 @@ class Session:
             self._driver.quit()
         finally:
             self._driver = None
+        if self._owns_proxy:
+            # Captured flows live on in the store, so history stays readable.
+            self._owns_proxy = False
+            proxy.stop()
+            return "Browser closed and traffic capture stopped (history retained)."
         return "Browser closed."
 
     # -- element location --------------------------------------------------

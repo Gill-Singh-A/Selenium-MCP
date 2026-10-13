@@ -4,10 +4,15 @@ Exposes a broad surface of Selenium WebDriver functionality as MCP tools so an
 LLM client (Claude / Claude Code) can fully drive a browser: navigation, element
 interaction, forms, waits, JavaScript execution, cookies, windows/tabs/frames,
 alerts, mouse/keyboard action chains, screenshots and scraping.
+
+The browser is launched behind an embedded mitmproxy (see :mod:`selenium_mcp.proxy`),
+so the model can also read every request and response the page made — a Burp-style
+proxy history, searchable, replayable and exportable as HAR.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 from typing import Optional
@@ -17,7 +22,9 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import Select
 
+from . import proxy as traffic
 from .driver import BrowserError, resolve_by, session
+from .proxy import ProxyError, proxy
 
 mcp = FastMCP("selenium-mcp")
 
@@ -27,18 +34,22 @@ def _ok(message: str) -> str:
 
 
 def _wrap(fn):
-    """Decorator: turn BrowserError into a clean string result for the model."""
+    """Decorator: turn BrowserError into a clean string result for the model.
 
+    ``functools.wraps`` matters beyond cosmetics here: FastMCP derives each
+    tool's parameter schema from the wrapped function's signature, so without
+    it every tool would advertise only ``*args``/``**kwargs``.
+    """
+
+    @functools.wraps(fn)
     def inner(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
-        except BrowserError as exc:
+        except (BrowserError, ProxyError) as exc:
             return f"Error: {exc}"
         except Exception as exc:  # pragma: no cover - defensive
             return f"Error: {type(exc).__name__}: {exc}"
 
-    inner.__name__ = fn.__name__
-    inner.__doc__ = fn.__doc__
     return inner
 
 
@@ -54,8 +65,16 @@ def start_browser(
     window_height: int = 800,
     user_agent: Optional[str] = None,
     default_timeout: float = 10.0,
+    capture_traffic: bool = True,
+    proxy_port: Optional[int] = None,
+    capture_filter: Optional[str] = None,
 ) -> str:
-    """Launch a browser.
+    """Launch a browser, by default behind the traffic-capturing proxy.
+
+    With `capture_traffic` on, every request and response the browser makes —
+    including decrypted HTTPS — is recorded, so after navigating you can call
+    `list_requests`, `get_request`, `search_traffic` or `replay_request` to see
+    exactly what went over the wire.
 
     Args:
         browser: 'chrome', 'chromium' or 'firefox'.
@@ -64,6 +83,10 @@ def start_browser(
         window_height: Initial viewport height in pixels.
         user_agent: Optional custom User-Agent string.
         default_timeout: Default seconds to wait when locating elements.
+        capture_traffic: Route the browser through the capture proxy (default True).
+        proxy_port: Port for the proxy; a free one is chosen when omitted.
+        capture_filter: mitmproxy filter limiting what is recorded, e.g.
+            '~d example.com' for one domain. See `start_proxy` for the syntax.
     """
     return _ok(
         session.start(
@@ -73,6 +96,9 @@ def start_browser(
             window_height=window_height,
             user_agent=user_agent,
             default_timeout=default_timeout,
+            capture_traffic=capture_traffic,
+            proxy_port=proxy_port,
+            capture_filter=capture_filter,
         )
     )
 
@@ -644,7 +670,7 @@ def upload_file(
 # ---------------------------------------------------------------------------
 # Screenshots
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 @_wrap
 def screenshot(save_path: Optional[str] = None) -> Image | str:
     """Capture a screenshot of the current page.
@@ -660,7 +686,7 @@ def screenshot(save_path: Optional[str] = None) -> Image | str:
     return Image(data=png, format="png")
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 @_wrap
 def element_screenshot(
     strategy: str,
@@ -676,6 +702,340 @@ def element_screenshot(
             fh.write(png)
         return _ok(f"Saved element screenshot to {os.path.abspath(save_path)}")
     return Image(data=png, format="png")
+
+
+# ---------------------------------------------------------------------------
+# Traffic capture (embedded mitmproxy) — a Burp-style proxy history
+# ---------------------------------------------------------------------------
+@mcp.tool()
+@_wrap
+def start_proxy(
+    port: Optional[int] = None,
+    capture_filter: Optional[str] = None,
+    max_body_bytes: int = 200_000,
+    max_flows: int = 2000,
+    verify_upstream_certs: bool = False,
+) -> str:
+    """Start the capture proxy on its own (start_browser does this for you).
+
+    Useful to capture traffic from something other than this server's browser —
+    point any client at the returned proxy address — or to raise the capture
+    limits before browsing.
+
+    Args:
+        port: Listen port on 127.0.0.1; a free one is chosen when omitted.
+        capture_filter: mitmproxy filter expression; only matching flows are
+            recorded. Examples: '~d example.com' (domain), '~u /api/' (URL),
+            '~m POST' (method), '~d example.com & ~m POST' (both),
+            '!~d analytics.google.com' (exclude). Omit to record everything.
+        max_body_bytes: Per-body cap on what is stored (bodies above it are
+            truncated; the true size is still reported).
+        max_flows: Ring-buffer size; the oldest flows are dropped beyond it.
+        verify_upstream_certs: Reject invalid certificates on the server side
+            instead of tolerating them (default False, like Burp).
+    """
+    info = proxy.start(
+        port=port,
+        capture_filter=capture_filter,
+        max_body_bytes=max_body_bytes,
+        max_flows=max_flows,
+        verify_upstream_certs=verify_upstream_certs,
+    )
+    return _ok(
+        f"Capture proxy listening on {info['proxy']}.\n"
+        f"CA certificate: {info['ca_cert']}\n"
+        "Browsers started by start_browser trust it automatically; an external "
+        "client must either trust that CA file or ignore certificate errors."
+    )
+
+
+@mcp.tool()
+@_wrap
+def stop_proxy() -> str:
+    """Stop the capture proxy. Already-captured traffic stays readable."""
+    return _ok(proxy.stop())
+
+
+@mcp.tool()
+@_wrap
+def proxy_status() -> str:
+    """Report whether capture is running, where, and how much it has recorded."""
+    stats = proxy.store.stats()
+    lines = []
+    if proxy.is_running:
+        lines.append(f"Running on {proxy.proxy_url}")
+        lines.append(f"CA certificate: {proxy.ca_cert_path}")
+        lines.append(f"Capture filter: {proxy.capture_filter or '(none — recording everything)'}")
+        lines.append(f"Body cap: {proxy.max_body_bytes} bytes per message")
+    else:
+        lines.append("Not running. Call start_browser or start_proxy.")
+    lines.append(
+        f"History: {stats['stored']} stored of {stats['captured_total']} captured "
+        f"(capacity {stats['capacity']}, {stats['dropped_oldest']} oldest dropped)"
+    )
+    warnings = proxy.recent_logs()
+    if warnings:
+        lines.append("Recent proxy warnings:")
+        lines.extend(f"  {w}" for w in warnings[-5:])
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@_wrap
+def list_requests(
+    limit: int = 50,
+    host: Optional[str] = None,
+    method: Optional[str] = None,
+    status: Optional[int] = None,
+    url_contains: Optional[str] = None,
+    content_type: Optional[str] = None,
+    since_id: Optional[int] = None,
+    errors_only: bool = False,
+) -> str:
+    """List captured requests, newest last — the proxy history table.
+
+    Each row is `#id METHOD status content-type size time URL`; pass an id to
+    `get_request` for the full request and response. A trailing `R` on the id
+    marks a replayed request.
+
+    Args:
+        limit: Return at most this many of the most recent matches.
+        host: Only flows whose host contains this substring.
+        method: Exact HTTP method, e.g. 'POST'.
+        status: Exact response status code, e.g. 404.
+        url_contains: Only flows whose URL contains this substring.
+        content_type: Only flows whose response content-type contains this,
+            e.g. 'json' for API calls or 'javascript' for scripts.
+        since_id: Only flows newer than this id — pass the largest id you have
+            already seen to get just what an action generated.
+        errors_only: Only flows that failed before a response arrived.
+    """
+    flows = proxy.store.select(
+        host=host,
+        method=method,
+        status=status,
+        url_contains=url_contains,
+        content_type=content_type,
+        since_id=since_id,
+        errors_only=errors_only,
+    )
+    return traffic.render_table(flows[-limit:] if limit > 0 else flows)
+
+
+@mcp.tool()
+@_wrap
+def get_request(
+    flow_id: int,
+    max_body_chars: int = 4000,
+    headers: bool = True,
+) -> str:
+    """Show one captured transaction as raw HTTP: request, then response.
+
+    Args:
+        flow_id: The `#id` from `list_requests`.
+        max_body_chars: Per-body display cap; raise it to read a long response
+            (a whole JS bundle, say), lower it to save context.
+        headers: Include headers (set False for bodies only).
+    """
+    flow = proxy.store.get(flow_id)
+    if flow is None:
+        raise ProxyError(
+            f"No captured request #{flow_id}. Call list_requests to see what is stored "
+            "(the oldest flows are dropped once the buffer is full)."
+        )
+    return traffic.render_flow(flow, max_body_chars=max_body_chars, headers=headers)
+
+
+@mcp.tool()
+@_wrap
+def search_traffic(
+    query: str,
+    where: str = "any",
+    limit: int = 50,
+) -> str:
+    """Case-insensitively search captured traffic for a string.
+
+    Good for tracing where a value came from or went: an API key, a session
+    token, a CSRF nonce, a reflected parameter.
+
+    Args:
+        query: Substring to look for.
+        where: 'any' (default), 'url', 'headers', 'body', 'request_body' or
+            'response_body'.
+        limit: Return at most this many of the most recent matches.
+    """
+    allowed = {"any", "url", "headers", "body", "request_body", "response_body"}
+    if where not in allowed:
+        raise ProxyError(f"Unknown `where` {where!r}. Use one of: {', '.join(sorted(allowed))}.")
+    flows = proxy.store.select(predicate=lambda f: f.matches_text(query, where))
+    header = f"Searched {where} for {query!r}:\n"
+    return header + traffic.render_table(flows[-limit:] if limit > 0 else flows)
+
+
+@mcp.tool()
+@_wrap
+def wait_for_request(
+    url_contains: str,
+    timeout: float = 15.0,
+    method: Optional[str] = None,
+    status: Optional[int] = None,
+    include_existing: bool = True,
+    max_body_chars: int = 2000,
+) -> str:
+    """Block until a matching request is captured, then show it.
+
+    Use this after an action that fires a background request — a click that
+    triggers an XHR, a form submit, a lazy-loaded page — instead of guessing
+    how long to wait.
+
+    Args:
+        url_contains: Substring the request URL must contain.
+        timeout: Seconds to wait before giving up.
+        method: Also require this exact HTTP method.
+        status: Also require this exact response status code.
+        include_existing: Match a request already in the history (default True);
+            set False to wait only for new traffic.
+        max_body_chars: Per-body display cap for the result.
+    """
+    after_id = 0 if include_existing else proxy.store.last_id()
+
+    def matches(f) -> bool:
+        if url_contains.lower() not in f.url.lower():
+            return False
+        if method and f.method.upper() != method.upper():
+            return False
+        if status is not None and f.status_code != status:
+            return False
+        return True
+
+    flow = proxy.store.wait_for(matches, timeout=timeout, after_id=after_id)
+    if flow is None:
+        return (
+            f"No request matching {url_contains!r} was captured within {timeout}s. "
+            "Check that capture is running with proxy_status."
+        )
+    return traffic.render_flow(flow, max_body_chars=max_body_chars)
+
+
+@mcp.tool()
+@_wrap
+def replay_request(
+    flow_id: int,
+    method: Optional[str] = None,
+    url: Optional[str] = None,
+    headers: Optional[dict] = None,
+    body: Optional[str] = None,
+    remove_headers: Optional[list] = None,
+    follow_redirects: bool = False,
+    max_body_chars: int = 4000,
+) -> str:
+    """Re-send a captured request, optionally modified — Burp's Repeater.
+
+    The original request's headers and cookies are reused, so this replays an
+    authenticated call as the browser made it. Only what you override changes.
+    The replay goes through the proxy, so it is added to the history too (marked
+    `R`). Redirects are not followed by default, so you see the real response.
+
+    Args:
+        flow_id: The `#id` of the request to replay.
+        method: Override the HTTP method.
+        url: Override the full URL — the usual way to change a path or a
+            query parameter.
+        headers: Headers to set or replace, e.g. {"X-Role": "admin"}.
+        body: Replace the request body.
+        remove_headers: Header names to drop, e.g. ["Cookie"] to check whether
+            an endpoint is reachable unauthenticated.
+        follow_redirects: Follow 3xx responses instead of returning them.
+        max_body_chars: Per-body display cap for the result.
+    """
+    flow = proxy.store.get(flow_id)
+    if flow is None:
+        raise ProxyError(f"No captured request #{flow_id}. Call list_requests to see what is stored.")
+    result = proxy.replay(
+        flow,
+        method=method,
+        url=url,
+        headers=headers,
+        body=body,
+        remove_headers=remove_headers,
+        follow_redirects=follow_redirects,
+    )
+    req, resp = result["request"], result["response"]
+    out = [f"=== replay of #{flow_id} ===", "", "--- REQUEST ---", f"{req['method']} {req['url']}"]
+    out.extend(f"{k}: {v}" for k, v in req["headers"])
+    out.append("")
+    out.append(req["body"] or "[no body]")
+    out.append("")
+    out.append("--- RESPONSE ---")
+    out.append(f"{resp['status']} {resp['reason']}   ({result['duration_ms']}ms)")
+    out.extend(f"{k}: {v}" for k, v in resp["headers"])
+    out.append("")
+    if resp["binary"]:
+        out.append(f"[binary body, {resp['size']} bytes — not shown]")
+    else:
+        text = resp["body"] or "[no body]"
+        if len(text) > max_body_chars:
+            text = text[:max_body_chars] + f"\n[... truncated to {max_body_chars} chars]"
+        out.append(text)
+    if result["history_flow_id"]:
+        out.append(f"\nAlso captured in the history as #{result['history_flow_id']}.")
+    return "\n".join(out)
+
+
+@mcp.tool()
+@_wrap
+def traffic_stats() -> str:
+    """Summarise captured traffic by host, status code and content type."""
+    stats = proxy.store.stats()
+    if not stats["stored"]:
+        return "No traffic captured yet."
+    lines = [
+        f"{stats['stored']} flows stored ({stats['captured_total']} captured, "
+        f"{stats['dropped_oldest']} dropped), "
+        f"{stats['response_bytes']} response bytes.",
+        "",
+        "By host:",
+    ]
+    lines.extend(f"  {n:>5}  {h}" for h, n in list(stats["by_host"].items())[:25])
+    lines.append("By status:")
+    lines.extend(f"  {n:>5}  {k}" for k, n in stats["by_status"].items())
+    lines.append("By content type:")
+    lines.extend(f"  {n:>5}  {t}" for t, n in list(stats["by_content_type"].items())[:25])
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@_wrap
+def clear_traffic() -> str:
+    """Discard the captured history, so the next action's traffic stands alone."""
+    return _ok(f"Cleared {proxy.store.clear()} captured flow(s).")
+
+
+@mcp.tool()
+@_wrap
+def export_har(
+    save_path: str,
+    host: Optional[str] = None,
+    url_contains: Optional[str] = None,
+    since_id: Optional[int] = None,
+) -> str:
+    """Write captured traffic to a HAR 1.2 file (Burp, DevTools, any HAR viewer).
+
+    Unlike the display tools this keeps full fidelity — all headers and whole
+    stored bodies — so it is the right way to hand traffic to another tool or
+    keep it as evidence.
+
+    Args:
+        save_path: Where to write the .har file.
+        host: Only flows whose host contains this substring.
+        url_contains: Only flows whose URL contains this substring.
+        since_id: Only flows newer than this id.
+    """
+    flows = proxy.store.select(host=host, url_contains=url_contains, since_id=since_id)
+    if not flows:
+        return "No matching traffic to export."
+    path = traffic.write_har(flows, save_path)
+    return _ok(f"Wrote {len(flows)} flow(s) to {path}")
 
 
 def main() -> None:
